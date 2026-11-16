@@ -30,6 +30,7 @@ add_library(lsm
   src/manifest.cc
   src/memtable.cc
   src/merger.cc
+  src/server.cc
   src/sstable.cc
   src/wal.cc
 )
@@ -49,6 +50,9 @@ FetchContent_Declare(
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+add_executable(lsm_server tools/lsm_server.cc)
+target_link_libraries(lsm_server PRIVATE lsm)
+
 enable_testing()
 add_executable(lsm_tests
   tests/skiplist_test.cc
@@ -59,6 +63,7 @@ add_executable(lsm_tests
   tests/bloom_test.cc
   tests/db_test.cc
   tests/compaction_test.cc
+  tests/server_test.cc
 )
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 include(GoogleTest)
