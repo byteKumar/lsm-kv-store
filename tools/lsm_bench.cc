@@ -16,13 +16,17 @@
 // record, no fsync), like RocksDB's default. A separate workload measures
 // what fsync and F_FULLFSYNC per write cost.
 
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <numeric>
 #include <random>
@@ -221,18 +225,21 @@ void SyncWrites(const Args& a, const Values& vals) {
   }
 }
 
-std::string Sysctl(const char* name) {
+#ifdef __APPLE__
+std::string ChipName() {
   char buf[256];
   size_t len = sizeof(buf);
-  if (sysctlbyname(name, buf, &len, nullptr, 0) != 0) return "?";
+  if (sysctlbyname("machdep.cpu.brand_string", buf, &len, nullptr, 0) != 0) return "?";
   return std::string(buf, strnlen(buf, len));
 }
+#else
+std::string ChipName() { return "unknown"; }  // not needed off macOS
+#endif
 
-uint64_t SysctlU64(const char* name) {
-  uint64_t v = 0;
-  size_t len = sizeof(v);
-  if (sysctlbyname(name, &v, &len, nullptr, 0) != 0) return 0;
-  return v;
+uint64_t NumCores() { return static_cast<uint64_t>(sysconf(_SC_NPROCESSORS_ONLN)); }
+
+uint64_t RamBytes() {
+  return static_cast<uint64_t>(sysconf(_SC_PHYS_PAGES)) * static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
 }
 
 }  // namespace
@@ -265,8 +272,7 @@ int main(int argc, char** argv) {
   }
   fs::create_directories(a.dir);
   std::printf("MACHINE chip=\"%s\" cores=%" PRIu64 " ram_gb=%.1f\n",
-              Sysctl("machdep.cpu.brand_string").c_str(), SysctlU64("hw.ncpu"),
-              static_cast<double>(SysctlU64("hw.memsize")) / (1ull << 30));
+              ChipName().c_str(), NumCores(), static_cast<double>(RamBytes()) / (1ull << 30));
   std::printf("CONFIG num=%" PRIu64 " key_bytes=16 value_bytes=100 reads=%" PRIu64
               " scans=%" PRIu64 " scan_len=%" PRIu64
               " memtable_mb=64 block_size=4096 bloom_bits_per_key=10 sync=none threads=1\n",

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.build }} (clang 18)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: release
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+          - build: asan-ubsan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DLSM_SANITIZER=address
+          - build: tsan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DLSM_SANITIZER=thread
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          clang++-18 --version
+          cmake --version
+
+      # TSan cannot map its shadow memory with the high mmap randomization
+      # that recent Ubuntu kernels use; 28 bits is what TSan supports.
+      - name: Lower ASLR entropy for TSan
+        if: matrix.build == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build -j "$(nproc)" --timeout 300 --output-on-failure
+
+      # Smoke runs only (small sizes, numbers not reported anywhere): check
+      # that the tools and the fsync fallback for --sync full work on Linux.
+      - name: Benchmark smoke run
+        if: matrix.build == 'release'
+        run: ./build/lsm_bench --dir "$RUNNER_TEMP/bench" --num 50000 --reads 20000 --scans 200 --sync-writes 100
+
+      - name: Crash test smoke run (5 kills, --sync full)
+        if: matrix.build == 'release'
+        run: python3 -I scripts/crash_test.py --server build/lsm_server --dir "$RUNNER_TEMP/crash" --kills 5 --sync full
+
+  macos:
+    name: macOS release (Apple clang)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain versions
+        run: |
+          clang++ --version
+          cmake --version
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
+      - name: Test
+        run: ctest --test-dir build -j "$(sysctl -n hw.ncpu)" --timeout 300 --output-on-failure

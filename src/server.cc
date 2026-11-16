@@ -43,6 +43,27 @@ bool ParseCount(std::string_view s, size_t* out) {
   return true;
 }
 
+// Socket write that reports a closed peer as an error (EPIPE) instead of
+// raising SIGPIPE, which would kill the process. macOS uses SO_NOSIGPIPE on
+// the socket (set in AcceptLoop); Linux uses MSG_NOSIGNAL per call.
+Status SendAll(int fd, const char* data, size_t n) {
+#ifdef MSG_NOSIGNAL
+  constexpr int kFlags = MSG_NOSIGNAL;
+#else
+  constexpr int kFlags = 0;
+#endif
+  while (n > 0) {
+    ssize_t w = ::send(fd, data, n, kFlags);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return ErrnoStatus("send");
+    }
+    data += w;
+    n -= static_cast<size_t>(w);
+  }
+  return Status::OK();
+}
+
 void AppendError(std::string* reply, const std::string& msg) {
   reply->append("ERROR ").append(msg).append("\n");
 }
@@ -206,7 +227,7 @@ void Server::Serve(Conn* c) {
       AppendError(&reply, "line too long");
       open = false;
     }
-    if (!reply.empty() && !WriteAll(fd, reply.data(), reply.size()).ok()) break;
+    if (!reply.empty() && !SendAll(fd, reply.data(), reply.size()).ok()) break;
   }
   {
     std::lock_guard<std::mutex> l(mu_);

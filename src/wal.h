@@ -28,7 +28,9 @@ namespace lsm {
 enum class SyncMode {
   kNone,       // write(2) only: survives a process crash, not a power loss
   kFsync,      // fsync(2) after each record (macOS: may stay in the drive cache)
-  kFullFsync,  // macOS F_FULLFSYNC: asks the drive to flush its cache too
+  kFullFsync,  // macOS F_FULLFSYNC: asks the drive to flush its cache too.
+               // Elsewhere (no F_FULLFSYNC) this is plain fsync, which on
+               // Linux already flushes the drive cache.
 };
 
 const char* SyncModeName(SyncMode m);

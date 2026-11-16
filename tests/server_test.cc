@@ -83,6 +83,10 @@ class Client {
     a.sin_port = htons(static_cast<uint16_t>(port));
     ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     ok_ = ::connect(fd_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    ::setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));  // macOS: no SIGPIPE
+#endif
   }
   ~Client() {
     if (fd_ >= 0) ::close(fd_);
@@ -91,7 +95,11 @@ class Client {
   void Send(const std::string& s) {
     size_t off = 0;
     while (off < s.size()) {
-      ssize_t n = ::write(fd_, s.data() + off, s.size() - off);
+#ifdef MSG_NOSIGNAL
+      ssize_t n = ::send(fd_, s.data() + off, s.size() - off, MSG_NOSIGNAL);  // Linux: no SIGPIPE
+#else
+      ssize_t n = ::send(fd_, s.data() + off, s.size() - off, 0);
+#endif
       if (n <= 0) return;
       off += static_cast<size_t>(n);
     }
