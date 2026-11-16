@@ -41,8 +41,18 @@ struct SSTableOptions {
   int bloom_bits_per_key = 10;  // 0 = write no filter
 };
 
+// Read counters. Each table keeps its own; a database can also pass one
+// shared set so totals survive tables being deleted by compaction.
+struct ReadStats {
+  std::atomic<uint64_t> block_reads{0};            // data blocks read from disk
+  std::atomic<uint64_t> bloom_checks{0};           // Get() consulted the filter
+  std::atomic<uint64_t> bloom_negatives{0};        // filter said "no": read skipped
+  std::atomic<uint64_t> bloom_false_positives{0};  // filter said "maybe", key absent
+};
+
 struct SSTableReadOptions {
-  bool use_bloom = true;  // false = ignore the filter (for A/B measurements)
+  bool use_bloom = true;               // false = ignore the filter (for A/B measurements)
+  ReadStats* shared_stats = nullptr;   // also count into this, if set
 };
 
 class SSTableWriter {
@@ -107,13 +117,15 @@ class SSTableReader {
   SequenceNumber max_seq() const { return max_seq_; }
 
   // Data blocks read from disk by this table so far (Get + iterators).
-  uint64_t block_reads() const { return block_reads_.load(std::memory_order_relaxed); }
+  uint64_t block_reads() const { return stats_.block_reads.load(std::memory_order_relaxed); }
   // Bloom statistics for Get(): filter consulted, filter said "no", and
   // filter said "maybe" but the key was not in the table (false positive).
-  uint64_t bloom_checks() const { return bloom_checks_.load(std::memory_order_relaxed); }
-  uint64_t bloom_negatives() const { return bloom_negatives_.load(std::memory_order_relaxed); }
+  uint64_t bloom_checks() const { return stats_.bloom_checks.load(std::memory_order_relaxed); }
+  uint64_t bloom_negatives() const {
+    return stats_.bloom_negatives.load(std::memory_order_relaxed);
+  }
   uint64_t bloom_false_positives() const {
-    return bloom_false_positives_.load(std::memory_order_relaxed);
+    return stats_.bloom_false_positives.load(std::memory_order_relaxed);
   }
 
  private:
@@ -141,10 +153,12 @@ class SSTableReader {
   uint64_t num_keys_ = 0;
   SequenceNumber min_seq_ = 0, max_seq_ = 0;
   bool use_bloom_ = true;
-  mutable std::atomic<uint64_t> block_reads_{0};
-  mutable std::atomic<uint64_t> bloom_checks_{0};
-  mutable std::atomic<uint64_t> bloom_negatives_{0};
-  mutable std::atomic<uint64_t> bloom_false_positives_{0};
+  void Count(std::atomic<uint64_t> ReadStats::*counter) const {
+    (stats_.*counter).fetch_add(1, std::memory_order_relaxed);
+    if (shared_stats_ != nullptr) (shared_stats_->*counter).fetch_add(1, std::memory_order_relaxed);
+  }
+  mutable ReadStats stats_;
+  ReadStats* shared_stats_ = nullptr;
 };
 
 // Decodes one data-block entry at the front of *input and advances it.

@@ -165,6 +165,7 @@ Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReade
   std::unique_ptr<SSTableReader> t(new SSTableReader());
   t->path_ = path;
   t->use_bloom_ = opts.use_bloom;
+  t->shared_stats_ = opts.shared_stats;
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (t->fd_ < 0) return ErrnoStatus("open " + path);
   struct stat st;
@@ -232,9 +233,9 @@ Status SSTableReader::Get(std::string_view key, std::string* value, GetResult* r
   // Bloom filter: a "no" is certain, so skip the disk read entirely.
   bool filter_used = use_bloom_ && !filter_.empty();
   if (filter_used) {
-    bloom_checks_.fetch_add(1, std::memory_order_relaxed);
+    Count(&ReadStats::bloom_checks);
     if (!BloomKeyMayMatch(filter_, key)) {
-      bloom_negatives_.fetch_add(1, std::memory_order_relaxed);
+      Count(&ReadStats::bloom_negatives);
       return Status::OK();
     }
   }
@@ -243,7 +244,7 @@ Status SSTableReader::Get(std::string_view key, std::string* value, GetResult* r
 
   std::string block;
   Status s = ReadBlock(index_[b].offset, index_[b].size, &block);
-  block_reads_.fetch_add(1, std::memory_order_relaxed);
+  Count(&ReadStats::block_reads);
   if (!s.ok()) return s;
 
   std::string_view in(block), k, v;
@@ -265,7 +266,7 @@ Status SSTableReader::Get(std::string_view key, std::string* value, GetResult* r
     break;
   }
   if (filter_used && *result == GetResult::kNotFound) {
-    bloom_false_positives_.fetch_add(1, std::memory_order_relaxed);
+    Count(&ReadStats::bloom_false_positives);
   }
   return Status::OK();
 }
@@ -306,7 +307,7 @@ class SSTableIterator : public Iterator {
     if (b >= t_->index_.size()) return false;
     const auto& e = t_->index_[b];
     Status s = t_->ReadBlock(e.offset, e.size, &block_);
-    t_->block_reads_.fetch_add(1, std::memory_order_relaxed);
+    t_->Count(&ReadStats::block_reads);
     if (!s.ok()) {
       status_ = s;
       return false;

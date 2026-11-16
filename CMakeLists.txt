@@ -25,8 +25,11 @@ endif()
 add_library(lsm
   src/bloom.cc
   src/crc32.cc
+  src/db.cc
   src/file_util.cc
+  src/manifest.cc
   src/memtable.cc
+  src/merger.cc
   src/sstable.cc
   src/wal.cc
 )
@@ -54,6 +57,7 @@ add_executable(lsm_tests
   tests/wal_test.cc
   tests/sstable_test.cc
   tests/bloom_test.cc
+  tests/db_test.cc
 )
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 include(GoogleTest)
