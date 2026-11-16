@@ -1,5 +1,7 @@
 # lsm-kv-store
 
+[![CI](https://github.com/byteKumar/lsm-kv-store/actions/workflows/ci.yml/badge.svg)](https://github.com/byteKumar/lsm-kv-store/actions/workflows/ci.yml)
+
 A persistent key-value storage engine in C++20, built as a log-structured merge tree (the design behind LevelDB, RocksDB and Cassandra's storage layer), with a small TCP server.
 
 - **Write-ahead log** with CRC32 checksums (ARMv8 CRC instructions), configurable sync (`none`, `fsync`, macOS `F_FULLFSYNC`), torn-tail recovery.
@@ -45,6 +47,8 @@ All tests in three builds (normal, ASan + UBSan + LeakSanitizer, TSan):
 ```bash
 ./scripts/test_all.sh
 ```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same three builds on Ubuntu 24.04 with clang 18, plus a Release build on macOS, on every push.
 
 On macOS 26.6 the ASan/TSan runtimes shipped with Apple clang 17 crash at startup (even for hello-world), so the sanitizer builds use Homebrew LLVM (`brew install llvm`); override with `SAN_CXX=...`.
 
