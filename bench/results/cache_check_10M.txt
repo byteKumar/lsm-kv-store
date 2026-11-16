@@ -1,0 +1,8 @@
+MACHINE chip="Apple M3" cores=8 ram_gb=16.0
+CONFIG num=10000000 key_bytes=16 value_bytes=100 reads=1000000 scans=10000 scan_len=1000 memtable_mb=64 block_size=4096 bloom_bits_per_key=10 sync=none threads=1
+RESULT fillrandom keys=10000000 seconds=25.184 writes_per_sec=397073 background_catchup_seconds=0.534 write_amp=4.591 write_amp_excl_wal=3.376 dir_bytes=1357984629
+STATS fillrandom user_bytes=1160000000 wal_bytes=1410000000 flush_bytes=1357989083 compaction_bytes=2558121858 manifest_bytes=3712 flushes=34 compactions=10 write_stalls=0 tables=4 table_bytes=1357984549
+RESULT cachecheck_hit_pass1 reads=1000000 found=1000000 seconds=14.293 reads_per_sec=69966 block_reads=1019587 block_reads_per_lookup=1.0196 bloom_checks=3384071 bloom_false_positives=19587 measured_fp_rate=0.00579 tables=4
+RESULT cachecheck_hit_pass2 reads=1000000 found=1000000 seconds=1.986 reads_per_sec=503412 block_reads=1019462 block_reads_per_lookup=1.0195 bloom_checks=3383446 bloom_false_positives=19462 measured_fp_rate=0.00575 tables=4
+RESULT cachecheck_hit_pass3 reads=1000000 found=1000000 seconds=1.967 reads_per_sec=508281 block_reads=1019456 block_reads_per_lookup=1.0195 bloom_checks=3384640 bloom_false_positives=19456 measured_fp_rate=0.00575 tables=4
+build/lsm_bench --dir bench-data --mode cache-check  20.67s user 23.93s system 100% cpu 44.492 total

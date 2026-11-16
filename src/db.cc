@@ -606,7 +606,13 @@ DBStats DB::GetStats() const {
   st.write_stalls = write_stalls_.load();
   st.tombstones_dropped = tombstones_dropped_.load();
   st.versions_dropped = versions_dropped_.load();
-  auto v = CurrentVersion();
+  std::shared_ptr<const Version> v;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    v = version_;
+    st.flush_running = v->imm != nullptr;
+    st.compaction_running = compacting_;
+  }
   st.num_tables = v->tables.size();
   for (const auto& t : v->tables) st.table_bytes += t->reader->file_size();
   st.block_reads = read_stats_.block_reads.load();

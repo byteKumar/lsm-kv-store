@@ -1,7 +1,7 @@
 // lsm_server: serves a database directory over TCP.
 //
 //   lsm_server --dir DIR [--port 7070] [--host 127.0.0.1] [--sync none|fsync|full]
-//              [--memtable-mb 64] [--no-compaction]
+//              [--memtable-mb 64 | --memtable-kb N] [--no-compaction]
 //
 // Prints "listening on HOST:PORT" once ready. SIGINT/SIGTERM shut down
 // cleanly; kill -9 is what the crash test uses.
@@ -20,7 +20,7 @@ namespace {
 void Usage() {
   std::fprintf(stderr,
                "usage: lsm_server --dir DIR [--port N] [--host ADDR] [--sync none|fsync|full]\n"
-               "                  [--memtable-mb N] [--no-compaction]\n");
+               "                  [--memtable-mb N | --memtable-kb N] [--no-compaction]\n");
   std::exit(2);
 }
 }  // namespace
@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
     else if (a == "--sync") {
       if (!lsm::ParseSyncMode(need(), &options.sync_mode)) Usage();
     } else if (a == "--memtable-mb") options.memtable_size = std::stoul(need()) << 20;
+    else if (a == "--memtable-kb") options.memtable_size = std::stoul(need()) << 10;
     else if (a == "--no-compaction") options.compaction = false;
     else Usage();
   }

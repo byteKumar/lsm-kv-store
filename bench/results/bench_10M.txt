@@ -1,0 +1,14 @@
+MACHINE chip="Apple M3" cores=8 ram_gb=16.0
+CONFIG num=10000000 key_bytes=16 value_bytes=100 reads=1000000 scans=10000 scan_len=1000 memtable_mb=64 block_size=4096 bloom_bits_per_key=10 sync=none threads=1
+RESULT fillseq keys=10000000 seconds=19.047 writes_per_sec=525023 background_catchup_seconds=1.252 write_amp=4.591 write_amp_excl_wal=3.376 dir_bytes=1357984629
+STATS fillseq user_bytes=1160000000 wal_bytes=1410000000 flush_bytes=1357989083 compaction_bytes=2558121858 manifest_bytes=3744 flushes=34 compactions=10 write_stalls=0 tables=4 table_bytes=1357984549
+RESULT fillrandom keys=10000000 seconds=25.379 writes_per_sec=394026 background_catchup_seconds=0.564 write_amp=4.591 write_amp_excl_wal=3.376 dir_bytes=1357984629
+STATS fillrandom user_bytes=1160000000 wal_bytes=1410000000 flush_bytes=1357989083 compaction_bytes=2558121858 manifest_bytes=3712 flushes=34 compactions=10 write_stalls=0 tables=4 table_bytes=1357984549
+RESULT readrandom_hit reads=1000000 found=1000000 seconds=8.975 reads_per_sec=111419 block_reads=1019587 block_reads_per_lookup=1.0196 bloom_checks=3384071 bloom_false_positives=19587 measured_fp_rate=0.00579 tables=4
+RESULT readrandom_miss_bloom_on reads=1000000 found=0 seconds=0.280 reads_per_sec=3565132 block_reads=32361 block_reads_per_lookup=0.0324 bloom_checks=3999998 bloom_false_positives=32361 measured_fp_rate=0.00809 tables=4
+RESULT scan scans=10000 scan_len=1000 short_scans=0 p50_ms=0.1120 p99_ms=0.1273 max_ms=0.1773 total_seconds=1.128
+RESULT readrandom_miss_bloom_off reads=1000000 found=0 seconds=6.438 reads_per_sec=155336 block_reads=3999985 block_reads_per_lookup=4.0000 bloom_checks=0 bloom_false_positives=0 measured_fp_rate=0.00000 tables=4
+RESULT sync_none writes=2000 writes_per_sec=548434 p50_us=1.5 p99_us=4.5
+RESULT sync_fsync writes=2000 writes_per_sec=48031 p50_us=17.8 p99_us=48.5
+RESULT sync_full writes=2000 writes_per_sec=336 p50_us=2999.4 p99_us=4050.0
+build/lsm_bench --dir bench-data  30.17s user 45.93s system 109% cpu 1:09.55 total

@@ -83,6 +83,8 @@ struct DBStats {
   uint64_t versions_dropped = 0;    // older versions removed by flush/compaction
   uint64_t num_tables = 0;
   uint64_t table_bytes = 0;         // total size of live tables
+  bool flush_running = false;       // a frozen memtable is being written out
+  bool compaction_running = false;
   uint64_t block_reads = 0;             // for Get() and user scans
   uint64_t compaction_block_reads = 0;  // background compaction, counted apart
   uint64_t bloom_checks = 0;

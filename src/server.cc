@@ -112,7 +112,9 @@ bool HandleCommand(DB* db, std::string_view line, std::string* reply) {
                   " compactions=" + std::to_string(st.compactions) +
                   " user_bytes=" + std::to_string(st.user_bytes_written) +
                   " disk_bytes=" + std::to_string(st.DiskBytesWritten()) +
-                  " write_stalls=" + std::to_string(st.write_stalls) + "\n");
+                  " write_stalls=" + std::to_string(st.write_stalls) +
+                  " flush_running=" + std::to_string(st.flush_running) +
+                  " compaction_running=" + std::to_string(st.compaction_running) + "\n");
   } else if (cmd == "QUIT") {
     reply->append("BYE\n");
     return false;

@@ -52,6 +52,8 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(lsm_server tools/lsm_server.cc)
 target_link_libraries(lsm_server PRIVATE lsm)
+add_executable(lsm_bench tools/lsm_bench.cc)
+target_link_libraries(lsm_bench PRIVATE lsm)
 
 enable_testing()
 add_executable(lsm_tests
