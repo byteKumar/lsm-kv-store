@@ -9,15 +9,17 @@
 //   ...
 //   [index block][crc]      one entry per data block: its last key + seq,
 //                           offset and size (a "sparse" index)
-//   [filter block][crc]     Bloom filter (empty until milestone 4)
-//   [props block][crc]      smallest/largest key, entry count, seq range
+//   [filter block][crc]     Bloom filter over the table's keys (empty if off)
+//   [props block][crc]      smallest/largest key, entry/key counts, seq range
 //   [footer, 56 bytes]      offsets and sizes of index/filter/props + magic
 //
 // Each data block holds entries back to back, ~4 KB per block:
 //   [key_len u32][key][seq u64][type u8][value_len u32][value]
 //
-// A point lookup binary-searches the in-memory index to find the single
-// block that could hold the key, then reads only that block from disk.
+// A point lookup first checks the key range and the Bloom filter (both in
+// memory). Only if the filter says "maybe" does it binary-search the
+// in-memory index for the single block that could hold the key and read that
+// one block from disk.
 
 #include <atomic>
 #include <cstdint>
@@ -26,6 +28,7 @@
 #include <string_view>
 #include <vector>
 
+#include "bloom.h"
 #include "iterator.h"
 #include "status.h"
 #include "types.h"
@@ -35,6 +38,11 @@ namespace lsm {
 
 struct SSTableOptions {
   size_t block_size = 4096;
+  int bloom_bits_per_key = 10;  // 0 = write no filter
+};
+
+struct SSTableReadOptions {
+  bool use_bloom = true;  // false = ignore the filter (for A/B measurements)
 };
 
 class SSTableWriter {
@@ -66,6 +74,8 @@ class SSTableWriter {
   std::string smallest_key_;
   SequenceNumber min_seq_ = kMaxSequenceNumber, max_seq_ = 0;
   uint64_t num_entries_ = 0;
+  uint64_t num_keys_ = 0;  // distinct user keys
+  std::unique_ptr<BloomFilterBuilder> bloom_;
   uint64_t offset_ = 0;  // bytes written so far
   Status status_;
   bool finished_ = false;
@@ -76,7 +86,8 @@ class SSTableReader {
   enum class GetResult { kNotFound, kFound, kDeleted };
 
   ~SSTableReader();
-  static Status Open(const std::string& path, std::unique_ptr<SSTableReader>* out);
+  static Status Open(const std::string& path, std::unique_ptr<SSTableReader>* out,
+                     SSTableReadOptions opts = {});
 
   // Finds the newest version of key in this table. Thread-safe.
   Status Get(std::string_view key, std::string* value, GetResult* result) const;
@@ -87,6 +98,9 @@ class SSTableReader {
   const std::string& smallest_key() const { return smallest_key_; }
   const std::string& largest_key() const { return largest_key_; }
   uint64_t num_entries() const { return num_entries_; }
+  uint64_t num_keys() const { return num_keys_; }  // distinct user keys
+  uint64_t filter_bits() const { return filter_.empty() ? 0 : (filter_.size() - 1) * 8; }
+  int filter_probes() const { return filter_.empty() ? 0 : static_cast<uint8_t>(filter_.back()); }
   uint64_t num_blocks() const { return index_.size(); }
   uint64_t file_size() const { return file_size_; }
   SequenceNumber min_seq() const { return min_seq_; }
@@ -94,6 +108,13 @@ class SSTableReader {
 
   // Data blocks read from disk by this table so far (Get + iterators).
   uint64_t block_reads() const { return block_reads_.load(std::memory_order_relaxed); }
+  // Bloom statistics for Get(): filter consulted, filter said "no", and
+  // filter said "maybe" but the key was not in the table (false positive).
+  uint64_t bloom_checks() const { return bloom_checks_.load(std::memory_order_relaxed); }
+  uint64_t bloom_negatives() const { return bloom_negatives_.load(std::memory_order_relaxed); }
+  uint64_t bloom_false_positives() const {
+    return bloom_false_positives_.load(std::memory_order_relaxed);
+  }
 
  private:
   friend class SSTableIterator;
@@ -117,8 +138,13 @@ class SSTableReader {
   std::string filter_;
   std::string smallest_key_, largest_key_;
   uint64_t num_entries_ = 0;
+  uint64_t num_keys_ = 0;
   SequenceNumber min_seq_ = 0, max_seq_ = 0;
+  bool use_bloom_ = true;
   mutable std::atomic<uint64_t> block_reads_{0};
+  mutable std::atomic<uint64_t> bloom_checks_{0};
+  mutable std::atomic<uint64_t> bloom_negatives_{0};
+  mutable std::atomic<uint64_t> bloom_false_positives_{0};
 };
 
 // Decodes one data-block entry at the front of *input and advances it.

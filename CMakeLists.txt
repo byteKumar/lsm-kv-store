@@ -23,6 +23,7 @@ elseif(NOT LSM_SANITIZER STREQUAL "")
 endif()
 
 add_library(lsm
+  src/bloom.cc
   src/crc32.cc
   src/file_util.cc
   src/memtable.cc
@@ -52,6 +53,7 @@ add_executable(lsm_tests
   tests/crc32_coding_test.cc
   tests/wal_test.cc
   tests/sstable_test.cc
+  tests/bloom_test.cc
 )
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 include(GoogleTest)

@@ -41,6 +41,9 @@ Status SSTableWriter::Open(const std::string& path, const SSTableOptions& opts,
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) return ErrnoStatus("open " + path);
   out->reset(new SSTableWriter(fd, opts));
+  if (opts.bloom_bits_per_key > 0) {
+    (*out)->bloom_ = std::make_unique<BloomFilterBuilder>(opts.bloom_bits_per_key);
+  }
   return Status::OK();
 }
 
@@ -52,6 +55,11 @@ Status SSTableWriter::Add(std::string_view key, SequenceNumber seq, ValueType ty
     return Status::InvalidArgument("keys added out of order");
   }
   if (num_entries_ == 0) smallest_key_.assign(key);
+  // Several versions of a key are adjacent; the filter needs each key once.
+  if (num_entries_ == 0 || key != std::string_view(last_key_)) {
+    num_keys_++;
+    if (bloom_) bloom_->AddKey(key);
+  }
   PutLengthPrefixed(&block_, key);
   PutFixed64(&block_, seq);
   block_.push_back(static_cast<char>(type));
@@ -105,13 +113,15 @@ Status SSTableWriter::Finish(SyncMode mode) {
   uint64_t index_off = 0, index_size = 0, filter_off = 0, filter_size = 0, props_off = 0,
            props_size = 0;
   if (s.ok()) s = WriteBlockWithCrc(index_, &index_off, &index_size);
-  if (s.ok()) s = WriteBlockWithCrc(std::string(), &filter_off, &filter_size);
+  std::string filter = bloom_ ? bloom_->Finish() : std::string();
+  if (s.ok()) s = WriteBlockWithCrc(filter, &filter_off, &filter_size);
   std::string props;
   PutLengthPrefixed(&props, smallest_key_);
   PutLengthPrefixed(&props, last_key_);
   PutFixed64(&props, num_entries_);
   PutFixed64(&props, min_seq_);
   PutFixed64(&props, max_seq_);
+  PutFixed64(&props, num_keys_);
   if (s.ok()) s = WriteBlockWithCrc(props, &props_off, &props_size);
 
   std::string footer;
@@ -150,9 +160,11 @@ Status SSTableReader::ReadBlock(uint64_t offset, uint64_t size, std::string* out
   return Status::OK();
 }
 
-Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReader>* out) {
+Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReader>* out,
+                           SSTableReadOptions opts) {
   std::unique_ptr<SSTableReader> t(new SSTableReader());
   t->path_ = path;
+  t->use_bloom_ = opts.use_bloom;
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (t->fd_ < 0) return ErrnoStatus("open " + path);
   struct stat st;
@@ -189,7 +201,7 @@ Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReade
   }
 
   std::string_view p(props), small, large;
-  if (!GetLengthPrefixed(&p, &small) || !GetLengthPrefixed(&p, &large) || p.size() != 24) {
+  if (!GetLengthPrefixed(&p, &small) || !GetLengthPrefixed(&p, &large) || p.size() != 32) {
     return Status::Corruption("bad props block: " + path);
   }
   t->smallest_key_.assign(small);
@@ -197,6 +209,7 @@ Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReade
   t->num_entries_ = DecodeFixed64(p.data());
   t->min_seq_ = DecodeFixed64(p.data() + 8);
   t->max_seq_ = DecodeFixed64(p.data() + 16);
+  t->num_keys_ = DecodeFixed64(p.data() + 24);
   if (t->index_.empty()) return Status::Corruption("table has no blocks: " + path);
   *out = std::move(t);
   return Status::OK();
@@ -215,6 +228,15 @@ Status SSTableReader::Get(std::string_view key, std::string* value, GetResult* r
   // Outside the table's key range: answer without touching the disk.
   if (key < std::string_view(smallest_key_) || key > std::string_view(largest_key_)) {
     return Status::OK();
+  }
+  // Bloom filter: a "no" is certain, so skip the disk read entirely.
+  bool filter_used = use_bloom_ && !filter_.empty();
+  if (filter_used) {
+    bloom_checks_.fetch_add(1, std::memory_order_relaxed);
+    if (!BloomKeyMayMatch(filter_, key)) {
+      bloom_negatives_.fetch_add(1, std::memory_order_relaxed);
+      return Status::OK();
+    }
   }
   size_t b = FindBlock(key, kMaxSequenceNumber);
   if (b == index_.size()) return Status::OK();
@@ -240,7 +262,10 @@ Status SSTableReader::Get(std::string_view key, std::string* value, GetResult* r
         *result = GetResult::kFound;
       }
     }
-    return Status::OK();
+    break;
+  }
+  if (filter_used && *result == GetResult::kNotFound) {
+    bloom_false_positives_.fetch_add(1, std::memory_order_relaxed);
   }
   return Status::OK();
 }

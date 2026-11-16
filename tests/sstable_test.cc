@@ -41,9 +41,11 @@ void BuildEvenTable(const std::string& path, int n, size_t block_size = 4096) {
   ASSERT_TRUE(w->Finish(SyncMode::kNone).ok());
 }
 
-std::unique_ptr<SSTableReader> OpenTable(const std::string& path) {
+std::unique_ptr<SSTableReader> OpenTable(const std::string& path, bool use_bloom = true) {
   std::unique_ptr<SSTableReader> r;
-  Status s = SSTableReader::Open(path, &r);
+  SSTableReadOptions ro;
+  ro.use_bloom = use_bloom;
+  Status s = SSTableReader::Open(path, &r, ro);
   EXPECT_TRUE(s.ok()) << s.ToString();
   return r;
 }
@@ -75,12 +77,13 @@ TEST(SSTableTest, PointLookupsHitAndMiss) {
 }
 
 // The sparse index means each lookup reads exactly one data block, and keys
-// outside [smallest, largest] read none.
+// outside [smallest, largest] read none. (Bloom filter off here, so misses
+// inside the range really go to the block.)
 TEST(SSTableTest, EachLookupReadsAtMostOneBlock) {
   test::TempDir dir;
   std::string path = dir.File("t.sst");
   BuildEvenTable(path, 5000);
-  auto t = OpenTable(path);
+  auto t = OpenTable(path, /*use_bloom=*/false);
   std::string v;
   GR r;
   for (int i : {0, 1, 2, 777, 4242, 9997, 9998}) {
@@ -343,7 +346,7 @@ TEST(SSTableTest, ConcurrentGets) {
   test::TempDir dir;
   std::string path = dir.File("t.sst");
   BuildEvenTable(path, 5000);
-  auto t = OpenTable(path);
+  auto t = OpenTable(path, /*use_bloom=*/false);
   std::vector<std::thread> threads;
   std::atomic<int> errors{0};
   std::atomic<uint64_t> in_range{0};  // lookups inside [smallest, largest] read one block
