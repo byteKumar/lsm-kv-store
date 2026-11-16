@@ -16,7 +16,7 @@ run() {
   echo "=== $dir ($*)"
   cmake -S . -B "$dir" "$@" >/dev/null
   cmake --build "$dir" -j "$jobs" >/dev/null
-  ctest --test-dir "$dir" -j "$jobs" --output-on-failure 2>&1 | tail -3
+  ctest --test-dir "$dir" -j "$jobs" --timeout 300 --output-on-failure 2>&1 | tail -3
 }
 
 run build -DCMAKE_BUILD_TYPE=Release

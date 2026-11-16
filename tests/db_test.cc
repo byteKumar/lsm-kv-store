@@ -109,7 +109,7 @@ TEST(DBTest, RandomOpsMatchModelAcrossFlushesAndReopen) {
     }
     DBStats st = db->GetStats();
     EXPECT_GT(st.flushes, 20u);
-    EXPECT_GT(st.num_tables, 20u);
+    EXPECT_GT(st.compactions, 0u);
     for (int i = 0; i < 4100; i++) {
       auto it = model.find(Key(i));
       std::string want = (it == model.end() || !it->second) ? "<missing>" : *it->second;
@@ -149,13 +149,13 @@ TEST(DBTest, CrashSnapshotRecoversAllAcknowledgedWrites) {
   test::TempDir dir, copy;
   auto db = OpenDB(dir.path());
   for (int i = 0; i < 5000; i++) ASSERT_TRUE(db->Put(Key(i), std::to_string(i)).ok());
-  // Wait for background flushes so the copy (which is not atomic across
-  // files) cannot race with one. The last writes stay in the memtable and
+  // Wait for background flushes and compactions so the copy (which is not
+  // atomic across files) cannot race with one. The last writes stay in the memtable and
   // exist only in the WAL. The real kill -9 test (milestone 8) covers crashes
   // in the middle of a flush.
   ASSERT_TRUE(db->Flush().ok());
+  ASSERT_TRUE(db->WaitForIdle().ok());  // no compaction running during the copy either
   for (int i = 5000; i < 5100; i++) ASSERT_TRUE(db->Put(Key(i), std::to_string(i)).ok());
-  ASSERT_EQ(db->GetStats().flushes, db->GetStats().num_tables);
   fs::copy(dir.path(), copy.path(), fs::copy_options::recursive | fs::copy_options::overwrite_existing);
   fs::remove(LockFileName(copy.path()));  // the copy is a different file: drop the stale lock file
   auto recovered = OpenDB(copy.path());
@@ -285,14 +285,17 @@ TEST(DBTest, MissingTableOrBadManifestFailsOpen) {
 
 TEST(DBTest, StatsCountBytes) {
   test::TempDir dir;
-  auto db = OpenDB(dir.path());
+  Options o = SmallOptions();
+  o.compaction = false;
+  auto db = OpenDB(dir.path(), o);
   for (int i = 0; i < 2000; i++) ASSERT_TRUE(db->Put(Key(i), std::string(100, 'v')).ok());
   ASSERT_TRUE(db->Flush().ok());
   DBStats st = db->GetStats();
   EXPECT_EQ(st.user_bytes_written, 2000u * (13 + 100));
   EXPECT_GT(st.wal_bytes, st.user_bytes_written);  // headers + seq + lengths
   EXPECT_GT(st.flush_bytes, st.user_bytes_written);
-  EXPECT_EQ(st.table_bytes, st.flush_bytes);  // no compaction yet
+  EXPECT_EQ(st.compactions, 0u);
+  EXPECT_EQ(st.table_bytes, st.flush_bytes);  // nothing compacted, so all table bytes came from flushes
 }
 
 TEST(DBTest, BlockReadsAndBloomStats) {
@@ -300,6 +303,7 @@ TEST(DBTest, BlockReadsAndBloomStats) {
   auto db = OpenDB(dir.path());
   for (int i = 0; i < 2000; i += 2) ASSERT_TRUE(db->Put(Key(i), "v").ok());
   ASSERT_TRUE(db->Flush().ok());
+  ASSERT_TRUE(db->WaitForIdle().ok());
   DBStats before = db->GetStats();
   for (int i = 1; i < 2000; i += 2) EXPECT_EQ(GetOrMissing(db.get(), Key(i)), "<missing>");
   DBStats after = db->GetStats();

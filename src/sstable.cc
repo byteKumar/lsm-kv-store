@@ -275,7 +275,8 @@ Status SSTableReader::Get(std::string_view key, std::string* value, GetResult* r
 
 class SSTableIterator : public Iterator {
  public:
-  explicit SSTableIterator(const SSTableReader* t) : t_(t) {}
+  SSTableIterator(const SSTableReader* t, bool for_compaction)
+      : t_(t), for_compaction_(for_compaction) {}
 
   bool Valid() const override { return valid_; }
   Status status() const override { return status_; }
@@ -307,7 +308,7 @@ class SSTableIterator : public Iterator {
     if (b >= t_->index_.size()) return false;
     const auto& e = t_->index_[b];
     Status s = t_->ReadBlock(e.offset, e.size, &block_);
-    t_->Count(&ReadStats::block_reads);
+    t_->Count(for_compaction_ ? &ReadStats::compaction_block_reads : &ReadStats::block_reads);
     if (!s.ok()) {
       status_ = s;
       return false;
@@ -332,6 +333,7 @@ class SSTableIterator : public Iterator {
   }
 
   const SSTableReader* t_;
+  bool for_compaction_;
   size_t block_idx_ = 0;
   std::string block_;
   std::string_view rest_;
@@ -342,8 +344,8 @@ class SSTableIterator : public Iterator {
   ValueType type_ = ValueType::kValue;
 };
 
-std::unique_ptr<Iterator> SSTableReader::NewIterator() const {
-  return std::make_unique<SSTableIterator>(this);
+std::unique_ptr<Iterator> SSTableReader::NewIterator(bool for_compaction) const {
+  return std::make_unique<SSTableIterator>(this, for_compaction);
 }
 
 }  // namespace lsm

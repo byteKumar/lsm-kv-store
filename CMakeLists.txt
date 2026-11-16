@@ -58,6 +58,7 @@ add_executable(lsm_tests
   tests/sstable_test.cc
   tests/bloom_test.cc
   tests/db_test.cc
+  tests/compaction_test.cc
 )
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 include(GoogleTest)

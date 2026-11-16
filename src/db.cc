@@ -27,6 +27,56 @@ struct DB::Version {
   std::vector<std::shared_ptr<TableHandle>> tables;  // oldest first
 };
 
+struct DB::CompactionJob {
+  std::vector<std::shared_ptr<TableHandle>> inputs;  // adjacent, oldest first
+  bool includes_oldest = false;  // no older table exists, so tombstones can go
+  bool manual = false;
+};
+
+bool PickSizeTieredRun(const std::vector<uint64_t>& sizes, const Options& options, size_t* begin,
+                       size_t* end) {
+  const size_t n = sizes.size();
+  if (options.compaction_min_tables < 2 || n < options.compaction_min_tables) return false;
+  // Try runs ending at each table, newest first; grow each run toward older
+  // tables while every size stays within the ratio.
+  for (size_t e = n; e >= options.compaction_min_tables; e--) {
+    size_t b = e - 1;
+    uint64_t lo = std::max<uint64_t>(sizes[b], 1), hi = lo;
+    while (b > 0 && e - b < options.compaction_max_tables) {
+      uint64_t s = std::max<uint64_t>(sizes[b - 1], 1);
+      uint64_t nlo = std::min(lo, s), nhi = std::max(hi, s);
+      if (static_cast<double>(nhi) > options.compaction_size_ratio * static_cast<double>(nlo)) break;
+      b--;
+      lo = nlo;
+      hi = nhi;
+    }
+    if (e - b >= options.compaction_min_tables) {
+      *begin = b;
+      *end = e;
+      return true;
+    }
+  }
+  // No similar-size run, but so many tables that writers are about to stall.
+  // Waiting for a run that may never form would block writers forever (sizes
+  // that each differ by 2x never qualify), so merge the cheapest group of
+  // adjacent tables instead.
+  if (n >= options.stall_table_count) {
+    const size_t w = options.compaction_min_tables;
+    uint64_t best = UINT64_MAX;
+    for (size_t b = 0; b + w <= n; b++) {
+      uint64_t total = 0;
+      for (size_t i = b; i < b + w; i++) total += sizes[i];
+      if (total <= best) {  // ties go to the newer group
+        best = total;
+        *begin = b;
+        *end = b + w;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
 DB::DB(const Options& options, std::string dir) : options_(options), dir_(std::move(dir)) {}
 
 DB::~DB() {
@@ -35,7 +85,10 @@ DB::~DB() {
     shutting_down_ = true;
   }
   bg_cv_.notify_all();
-  if (bg_thread_.joinable()) bg_thread_.join();
+  compaction_cv_.notify_all();
+  done_cv_.notify_all();
+  if (flush_thread_.joinable()) flush_thread_.join();
+  if (compaction_thread_.joinable()) compaction_thread_.join();
   if (wal_) wal_->Close();
   if (lock_fd_ >= 0) ::close(lock_fd_);  // also releases the flock
 }
@@ -44,7 +97,8 @@ Status DB::Open(const Options& options, const std::string& dir, std::unique_ptr<
   std::unique_ptr<DB> db(new DB(options, dir));
   Status s = db->Recover();
   if (!s.ok()) return s;
-  db->bg_thread_ = std::thread([p = db.get()] { p->BackgroundThread(); });
+  db->flush_thread_ = std::thread([p = db.get()] { p->FlushThread(); });
+  db->compaction_thread_ = std::thread([p = db.get()] { p->CompactionThread(); });
   *out = std::move(db);
   return Status::OK();
 }
@@ -66,8 +120,10 @@ Status DB::OpenTable(uint64_t number, std::shared_ptr<TableHandle>* handle) {
   return Status::OK();
 }
 
-Status DB::WriteTable(Iterator* it, uint64_t number, uint64_t* file_size,
+Status DB::WriteTable(Iterator* it, uint64_t number, bool drop_tombstones, uint64_t* file_size,
                       std::shared_ptr<TableHandle>* handle) {
+  handle->reset();
+  *file_size = 0;
   SSTableOptions opts;
   opts.block_size = options_.block_size;
   opts.bloom_bits_per_key = options_.bloom_bits_per_key;
@@ -76,19 +132,30 @@ Status DB::WriteTable(Iterator* it, uint64_t number, uint64_t* file_size,
   Status s = SSTableWriter::Open(path, opts, &w);
   if (!s.ok()) return s;
   // Keep only the newest version of each key: nothing (no snapshot) can read
-  // the older ones. Tombstones are kept because older tables may still hold
-  // the key and the tombstone has to hide it.
+  // the older ones. A tombstone is kept unless drop_tombstones says no older
+  // table exists that it would still have to hide something in.
   std::string prev;
   bool has_prev = false;
+  uint64_t n = 0;
   for (it->SeekToFirst(); it->Valid() && s.ok(); it->Next()) {
-    if (has_prev && it->key() == std::string_view(prev)) continue;
+    if (has_prev && it->key() == std::string_view(prev)) {
+      versions_dropped_++;
+      continue;
+    }
     prev.assign(it->key());
     has_prev = true;
+    if (drop_tombstones && it->type() == ValueType::kDeletion) {
+      tombstones_dropped_++;
+      continue;
+    }
     s = w->Add(it->key(), it->seq(), it->type(), it->value());
+    // Give up quickly on shutdown; the inputs are untouched and still live.
+    if ((++n & 0xfff) == 0 && shutting_down_.load()) s = Status::IOError("shutting down");
   }
   if (s.ok()) s = it->status();
-  if (s.ok()) s = w->Finish(options_.sync_mode);
-  if (!s.ok()) {
+  bool empty = s.ok() && w->NumEntries() == 0;
+  if (s.ok() && !empty) s = w->Finish(options_.sync_mode);
+  if (!s.ok() || empty) {
     w.reset();
     ::unlink(path.c_str());
     return s;
@@ -100,10 +167,7 @@ Status DB::WriteTable(Iterator* it, uint64_t number, uint64_t* file_size,
 ManifestState DB::MakeManifestState(const std::vector<std::shared_ptr<TableHandle>>& tables,
                                     uint64_t log_number) const {
   ManifestState st;
-  {
-    std::lock_guard<std::mutex> l(mu_);
-    st.next_file_number = next_file_number_;
-  }
+  st.next_file_number = next_file_number_;
   st.log_number = log_number;
   st.last_seq = last_seq_.load();
   for (const auto& t : tables) st.tables.push_back(t->number);
@@ -170,7 +234,7 @@ Status DB::Recover() {
     auto it = NewMemTableIterator(recovered.get());
     uint64_t size = 0;
     std::shared_ptr<TableHandle> h;
-    s = WriteTable(it.get(), next_file_number_++, &size, &h);
+    s = WriteTable(it.get(), next_file_number_++, /*drop_tombstones=*/false, &size, &h);
     if (!s.ok()) return s;
     flush_bytes_ += size;
     flushes_++;
@@ -225,7 +289,17 @@ Status DB::Delete(std::string_view key) { return Write(ValueType::kDeletion, key
 Status DB::Write(ValueType type, std::string_view key, std::string_view value) {
   std::unique_lock<std::mutex> wl(write_mu_);
   {
-    std::lock_guard<std::mutex> l(mu_);
+    std::unique_lock<std::mutex> l(mu_);
+    // Too many tables means compaction is behind: wait rather than let every
+    // read check an ever-growing list.
+    if (options_.compaction && version_->tables.size() >= options_.stall_table_count &&
+        bg_error_.ok()) {
+      write_stalls_++;
+      while (version_->tables.size() >= options_.stall_table_count && bg_error_.ok() &&
+             !shutting_down_) {
+        done_cv_.wait(l);
+      }
+    }
     if (!bg_error_.ok()) return bg_error_;
   }
   if (CurrentVersion()->mem->ApproximateMemoryUsage() >= options_.memtable_size) {
@@ -280,59 +354,164 @@ Status DB::SwitchMemTable(std::unique_lock<std::mutex>* /*write_lock*/) {
   return Status::OK();
 }
 
-void DB::BackgroundThread() {
+void DB::FlushThread() {
   std::unique_lock<std::mutex> l(mu_);
   while (true) {
-    bool flush = version_->imm != nullptr && bg_error_.ok();
-    if (flush) {
+    if (version_->imm != nullptr && bg_error_.ok()) {
       l.unlock();
       Status s = FlushImmutable();
       l.lock();
       if (!s.ok()) bg_error_ = s;
       done_cv_.notify_all();
+      compaction_cv_.notify_one();  // a new table may complete a run
       continue;
     }
-    if (shutting_down_) break;  // pending flushes are finished first
+    if (shutting_down_) break;  // a pending flush is finished first
     bg_cv_.wait(l);
   }
 }
 
+Status DB::InstallTables(
+    const std::function<std::vector<std::shared_ptr<TableHandle>>(
+        const std::vector<std::shared_ptr<TableHandle>>&)>& edit,
+    bool drop_imm) {
+  std::lock_guard<std::mutex> ml(manifest_mu_);
+  std::vector<std::shared_ptr<TableHandle>> tables;
+  ManifestState st;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    tables = edit(version_->tables);
+    // Logs older than log_number are fully in tables. While a frozen memtable
+    // is still waiting for its flush, its log is the oldest one needed.
+    uint64_t log_number = (!drop_imm && imm_log_number_ != 0) ? imm_log_number_ : log_number_;
+    st = MakeManifestState(tables, log_number);
+  }
+  // Table-list changes only happen under manifest_mu_, so the list cannot
+  // change while the manifest is being written.
+  uint64_t mbytes = 0;
+  Status s = WriteManifest(dir_, st, options_.sync_mode, &mbytes);
+  if (!s.ok()) return s;
+  manifest_bytes_ += mbytes;
+  std::lock_guard<std::mutex> l(mu_);
+  auto nv = std::make_shared<Version>(*version_);
+  nv->tables = std::move(tables);
+  if (drop_imm) {
+    nv->imm = nullptr;
+    imm_log_number_ = 0;
+  }
+  version_ = std::move(nv);
+  return Status::OK();
+}
+
 Status DB::FlushImmutable() {
   std::shared_ptr<const Version> v;
-  uint64_t number, log_number, old_log;
+  uint64_t number, old_log;
   {
     std::lock_guard<std::mutex> l(mu_);
     v = version_;
     number = next_file_number_++;
-    log_number = log_number_;
     old_log = imm_log_number_;
   }
   auto it = NewMemTableIterator(v->imm.get());
   uint64_t size = 0;
   std::shared_ptr<TableHandle> h;
-  Status s = WriteTable(it.get(), number, &size, &h);
+  Status s = WriteTable(it.get(), number, /*drop_tombstones=*/false, &size, &h);
   if (!s.ok()) return s;
   flush_bytes_ += size;
   flushes_++;
-
-  // Only this thread changes the table list, so v->tables is still current.
-  std::vector<std::shared_ptr<TableHandle>> tables = v->tables;
-  tables.push_back(h);
-  // The manifest now says: everything in logs older than log_number is in a
-  // table. Only after it is durable may the frozen memtable's log go away.
-  uint64_t mbytes = 0;
-  s = WriteManifest(dir_, MakeManifestState(tables, log_number), options_.sync_mode, &mbytes);
+  // The new manifest says everything in older logs is in tables. Only after
+  // it is durable may the frozen memtable's log go away.
+  s = InstallTables(
+      [&](const std::vector<std::shared_ptr<TableHandle>>& cur) {
+        auto t = cur;
+        if (h) t.push_back(h);  // newest end
+        return t;
+      },
+      /*drop_imm=*/true);
   if (!s.ok()) return s;
-  manifest_bytes_ += mbytes;
+  ::unlink(LogFileName(dir_, old_log).c_str());
+  return Status::OK();
+}
+
+bool DB::PickCompaction(CompactionJob* job) const {
+  const auto& tables = version_->tables;
+  if (manual_compaction_) {
+    if (tables.empty()) return false;
+    job->inputs = tables;
+    job->includes_oldest = true;
+    job->manual = true;
+    return true;
+  }
+  if (!options_.compaction) return false;
+  std::vector<uint64_t> sizes;
+  for (const auto& t : tables) sizes.push_back(t->reader->file_size());
+  size_t b, e;
+  if (!PickSizeTieredRun(sizes, options_, &b, &e)) return false;
+  job->inputs.assign(tables.begin() + static_cast<ptrdiff_t>(b),
+                     tables.begin() + static_cast<ptrdiff_t>(e));
+  job->includes_oldest = (b == 0);
+  job->manual = false;
+  return true;
+}
+
+void DB::CompactionThread() {
+  std::unique_lock<std::mutex> l(mu_);
+  while (!shutting_down_) {
+    CompactionJob job;
+    if (!bg_error_.ok() || !PickCompaction(&job)) {
+      compaction_cv_.wait(l);
+      continue;
+    }
+    compacting_ = true;
+    l.unlock();
+    Status s = RunCompaction(job);
+    l.lock();
+    compacting_ = false;
+    if (job.manual) manual_compaction_ = false;
+    if (!s.ok() && !shutting_down_) bg_error_ = s;
+    done_cv_.notify_all();
+  }
+}
+
+Status DB::RunCompaction(const CompactionJob& job) {
+  uint64_t number;
   {
     std::lock_guard<std::mutex> l(mu_);
-    auto nv = std::make_shared<Version>(*version_);
-    nv->imm = nullptr;
-    nv->tables = std::move(tables);
-    version_ = std::move(nv);
-    imm_log_number_ = 0;
+    number = next_file_number_++;
   }
-  ::unlink(LogFileName(dir_, old_log).c_str());
+  std::vector<std::unique_ptr<Iterator>> children;
+  for (const auto& t : job.inputs) children.push_back(t->reader->NewIterator(/*for_compaction=*/true));
+  auto merged = NewMergingIterator(std::move(children));
+  uint64_t size = 0;
+  std::shared_ptr<TableHandle> out;
+  Status s = WriteTable(merged.get(), number, job.includes_oldest, &size, &out);
+  if (!s.ok()) return s;
+  compaction_bytes_ += size;
+  compactions_++;
+
+  // Replace the run with the output, in the same position. A flush may have
+  // appended newer tables meanwhile; that does not move the run.
+  std::set<uint64_t> inputs;
+  for (const auto& t : job.inputs) inputs.insert(t->number);
+  s = InstallTables(
+      [&](const std::vector<std::shared_ptr<TableHandle>>& cur) {
+        std::vector<std::shared_ptr<TableHandle>> t;
+        bool placed = false;
+        for (const auto& h : cur) {
+          if (inputs.count(h->number)) {
+            if (!placed && out) t.push_back(out);
+            placed = true;
+          } else {
+            t.push_back(h);
+          }
+        }
+        return t;
+      },
+      /*drop_imm=*/false);
+  if (!s.ok()) return s;
+  // Readers that still hold the old version keep their open file
+  // descriptors, so unlinking now is safe on POSIX.
+  for (uint64_t n : inputs) ::unlink(TableFileName(dir_, n).c_str());
   return Status::OK();
 }
 
@@ -344,6 +523,32 @@ Status DB::Flush() {
   }
   std::unique_lock<std::mutex> l(mu_);
   while (version_->imm && bg_error_.ok()) done_cv_.wait(l);
+  return bg_error_;
+}
+
+Status DB::WaitForIdle() {
+  std::unique_lock<std::mutex> l(mu_);
+  while (bg_error_.ok() && !shutting_down_) {
+    CompactionJob job;
+    bool busy = version_->imm != nullptr || compacting_ || manual_compaction_ || PickCompaction(&job);
+    if (!busy) break;
+    compaction_cv_.notify_one();
+    done_cv_.wait(l);
+  }
+  return bg_error_;
+}
+
+Status DB::CompactAll() {
+  Status s = Flush();
+  if (!s.ok()) return s;
+  std::unique_lock<std::mutex> l(mu_);
+  // Let a running automatic compaction finish first.
+  while (compacting_ && bg_error_.ok()) done_cv_.wait(l);
+  if (!bg_error_.ok()) return bg_error_;
+  if (version_->tables.empty()) return Status::OK();  // nothing to compact
+  manual_compaction_ = true;
+  compaction_cv_.notify_one();
+  while (manual_compaction_ && bg_error_.ok() && !shutting_down_) done_cv_.wait(l);
   return bg_error_;
 }
 
@@ -399,10 +604,13 @@ DBStats DB::GetStats() const {
   st.flushes = flushes_.load();
   st.compactions = compactions_.load();
   st.write_stalls = write_stalls_.load();
+  st.tombstones_dropped = tombstones_dropped_.load();
+  st.versions_dropped = versions_dropped_.load();
   auto v = CurrentVersion();
   st.num_tables = v->tables.size();
   for (const auto& t : v->tables) st.table_bytes += t->reader->file_size();
   st.block_reads = read_stats_.block_reads.load();
+  st.compaction_block_reads = read_stats_.compaction_block_reads.load();
   st.bloom_checks = read_stats_.bloom_checks.load();
   st.bloom_negatives = read_stats_.bloom_negatives.load();
   st.bloom_false_positives = read_stats_.bloom_false_positives.load();

@@ -44,7 +44,8 @@ struct SSTableOptions {
 // Read counters. Each table keeps its own; a database can also pass one
 // shared set so totals survive tables being deleted by compaction.
 struct ReadStats {
-  std::atomic<uint64_t> block_reads{0};            // data blocks read from disk
+  std::atomic<uint64_t> block_reads{0};            // data blocks read for Get() and user scans
+  std::atomic<uint64_t> compaction_block_reads{0}; // data blocks read by compaction
   std::atomic<uint64_t> bloom_checks{0};           // Get() consulted the filter
   std::atomic<uint64_t> bloom_negatives{0};        // filter said "no": read skipped
   std::atomic<uint64_t> bloom_false_positives{0};  // filter said "maybe", key absent
@@ -102,7 +103,9 @@ class SSTableReader {
   // Finds the newest version of key in this table. Thread-safe.
   Status Get(std::string_view key, std::string* value, GetResult* result) const;
 
-  std::unique_ptr<Iterator> NewIterator() const;
+  // for_compaction: count block reads as compaction_block_reads, so
+  // background work does not inflate the per-lookup read numbers.
+  std::unique_ptr<Iterator> NewIterator(bool for_compaction = false) const;
 
   const std::string& path() const { return path_; }
   const std::string& smallest_key() const { return smallest_key_; }
