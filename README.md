@@ -19,16 +19,17 @@ Measured on an Apple M3 (16 GB, internal SSD) with 10M keys (16 B keys, 100 B va
 ### Write path
 
 ```mermaid
-flowchart LR
-    C["Client: PUT / DEL"] --> W["Write-ahead log<br/>CRC32 per record<br/>fsync or F_FULLFSYNC"]
-    W --> M["Active memtable<br/>skiplist"]
-    M --> OK["Reply OK"]
-    M -- "full" --> I["Immutable memtable"]
-    I -- "flush thread" --> S["New SSTable<br/>synced"]
-    S --> MF["MANIFEST<br/>write tmp, sync, rename, sync dir"]
-    MF --> D["Delete the old WAL"]
-    MF -.-> CP["Compaction thread<br/>size-tiered merge"]
-    CP -.-> MF
+flowchart TB
+    subgraph FG["Per write, on the client's thread"]
+        direction LR
+        C["PUT / DEL"] --> W["Append to WAL<br/>CRC32, fsync or F_FULLFSYNC"] --> M["Insert into<br/>skiplist memtable"] --> OK["Reply OK"]
+    end
+    subgraph BG["Background threads"]
+        direction LR
+        I["Immutable<br/>memtable"] -- "flush" --> S["New SSTable,<br/>synced"] --> MF["MANIFEST:<br/>write tmp, sync,<br/>rename, sync dir"] --> D["Delete<br/>old WAL"]
+        CP["Compaction:<br/>size-tiered merge"] -. "replace merged tables" .-> MF
+    end
+    FG -- "memtable full: freeze it, start a new memtable and WAL" --> BG
 ```
 
 A write is acknowledged only after it is in the WAL (synced per `--sync`) and in the memtable. When the memtable is full it is frozen, a new memtable and WAL take over, and a background thread writes the frozen one to an SSTable. The old WAL is deleted only after the manifest that lists the new table is durable.
@@ -36,24 +37,24 @@ A write is acknowledged only after it is in the WAL (synced per `--sync`) and in
 ### Read path
 
 ```mermaid
-flowchart TD
-    G["GET key"] --> M{"Active memtable"}
-    M -- "found or tombstone" --> R["Return value or NOT_FOUND"]
-    M -- "miss" --> I{"Immutable memtable"}
-    I -- "found or tombstone" --> R
-    I -- "miss" --> T["Next SSTable, newest first"]
-    T -- "no tables left" --> NF["NOT_FOUND"]
-    T --> K{"Key inside the table's<br/>min/max key range?"}
-    K -- "no" --> T
-    K -- "yes" --> B{"Bloom filter"}
-    B -- "definitely absent" --> T
-    B -- "maybe present" --> X["Binary search the sparse index<br/>in memory"]
-    X --> BL["pread one data block<br/>check CRC, scan the block"]
-    BL -- "found or tombstone" --> R
-    BL -- "absent: false positive" --> T
+flowchart LR
+    G["GET key"]
+    subgraph MEM["1. Memtables"]
+        direction TB
+        M["Active memtable"] --> I["Immutable memtable"]
+    end
+    subgraph SST["2. Each SSTable, newest first"]
+        direction TB
+        K{"Key inside the table's<br/>min/max range?"} -- "yes" --> B{"Bloom filter:<br/>maybe present?"} -- "yes" --> X["Binary search the<br/>sparse index, in memory"] --> BL["pread one data block,<br/>check CRC, scan it"]
+    end
+    G --> MEM
+    MEM -- "miss" --> SST
+    MEM -- "found or tombstone" --> R["Value or NOT_FOUND"]
+    SST -- "found or tombstone" --> R
+    SST -- "no table has the key" --> NF["NOT_FOUND"]
 ```
 
-The first version found wins, and a tombstone means the key is deleted. Range scans merge iterators over both memtables and every SSTable, and show only the newest version of each key visible at the scan's start.
+A "no" from the range check or the Bloom filter, or a block that turns out not to hold the key (a false positive), moves on to the next table. The first version found wins, and a tombstone means the key is deleted. Range scans merge iterators over both memtables and every SSTable, and show only the newest version of each key visible at the scan's start.
 
 ### SSTable layout
 
