@@ -10,52 +10,14 @@
 
 #include "coding.h"
 #include "crc32.h"
+#include "file_util.h"
 #include "memtable.h"
 
 namespace lsm {
 
 namespace {
-
-constexpr size_t kHeaderSize = 8;                     // crc32 + length
-constexpr uint32_t kMaxRecordSize = 64u << 20;        // sanity limit for a length field
-
-Status ErrnoStatus(const std::string& what) {
-  return Status::IOError(what + ": " + std::strerror(errno));
-}
-
-// write(2) can write fewer bytes than asked or be interrupted; loop until done.
-Status WriteAll(int fd, const char* data, size_t n) {
-  while (n > 0) {
-    ssize_t w = ::write(fd, data, n);
-    if (w < 0) {
-      if (errno == EINTR) continue;
-      return ErrnoStatus("write");
-    }
-    data += w;
-    n -= static_cast<size_t>(w);
-  }
-  return Status::OK();
-}
-
-Status SyncFd(int fd, SyncMode mode) {
-  if (mode == SyncMode::kNone) return Status::OK();
-#ifdef F_FULLFSYNC
-  if (mode == SyncMode::kFullFsync) {
-    if (::fcntl(fd, F_FULLFSYNC) == 0) return Status::OK();
-    // Some file systems do not support F_FULLFSYNC; fall back to fsync.
-  }
-#endif
-  if (::fsync(fd) != 0) return ErrnoStatus("fsync");
-  return Status::OK();
-}
-
-std::string DirName(const std::string& path) {
-  size_t pos = path.rfind('/');
-  if (pos == std::string::npos) return ".";
-  if (pos == 0) return "/";
-  return path.substr(0, pos);
-}
-
+constexpr size_t kHeaderSize = 8;               // crc32 + length
+constexpr uint32_t kMaxRecordSize = 64u << 20;  // sanity limit for a length field
 }  // namespace
 
 const char* SyncModeName(SyncMode m) {
@@ -92,15 +54,7 @@ Status WalWriter::Open(const std::string& path, SyncMode mode, uint64_t valid_by
   Status s = SyncFd(fd, mode);
   // A new file's directory entry is only durable once the directory itself
   // is synced; otherwise a power loss could lose the whole file.
-  if (s.ok() && !existed && mode != SyncMode::kNone) {
-    int dfd = ::open(DirName(path).c_str(), O_RDONLY | O_CLOEXEC);
-    if (dfd < 0) {
-      s = ErrnoStatus("open dir");
-    } else {
-      s = SyncFd(dfd, mode);
-      ::close(dfd);
-    }
-  }
+  if (s.ok() && !existed) s = SyncParentDir(path, mode);
   if (!s.ok()) {
     ::close(fd);
     return s;

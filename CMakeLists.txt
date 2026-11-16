@@ -24,7 +24,9 @@ endif()
 
 add_library(lsm
   src/crc32.cc
+  src/file_util.cc
   src/memtable.cc
+  src/sstable.cc
   src/wal.cc
 )
 target_include_directories(lsm PUBLIC src)
@@ -49,6 +51,7 @@ add_executable(lsm_tests
   tests/memtable_test.cc
   tests/crc32_coding_test.cc
   tests/wal_test.cc
+  tests/sstable_test.cc
 )
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 include(GoogleTest)
