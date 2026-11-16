@@ -23,7 +23,9 @@ elseif(NOT LSM_SANITIZER STREQUAL "")
 endif()
 
 add_library(lsm
+  src/crc32.cc
   src/memtable.cc
+  src/wal.cc
 )
 target_include_directories(lsm PUBLIC src)
 # Warnings for our code only (not for GoogleTest's sources).
@@ -45,6 +47,8 @@ enable_testing()
 add_executable(lsm_tests
   tests/skiplist_test.cc
   tests/memtable_test.cc
+  tests/crc32_coding_test.cc
+  tests/wal_test.cc
 )
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 include(GoogleTest)
