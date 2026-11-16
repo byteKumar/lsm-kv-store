@@ -22,12 +22,12 @@ elseif(NOT LSM_SANITIZER STREQUAL "")
   message(FATAL_ERROR "Unknown LSM_SANITIZER '${LSM_SANITIZER}'")
 endif()
 
-add_compile_options(-Wall -Wextra -Wpedantic)
-
 add_library(lsm
   src/memtable.cc
 )
 target_include_directories(lsm PUBLIC src)
+# Warnings for our code only (not for GoogleTest's sources).
+target_compile_options(lsm PUBLIC -Wall -Wextra -Wpedantic)
 
 # GoogleTest is downloaded at configure time and built with the same flags
 # (including sanitizers) as the rest of the project.
